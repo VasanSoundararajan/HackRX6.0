@@ -1,82 +1,94 @@
+import mimetypes
+from PyPDF2 import PdfReader
+from docx import Document
+from bs4 import BeautifulSoup
+import email
+from dotenv import load_dotenv
+import email.policy
+from openai import OpenAI
 import os
 import re
-import docx
-import email
 import requests
-from io import BytesIO
-from pathlib import Path
+from urllib.parse import urlparse
+
+# utils.py
+import mimetypes
+from PyPDF2 import PdfReader
+from docx import Document
+from bs4 import BeautifulSoup
+import email
 from dotenv import load_dotenv
-import PyPDF2
-from email import policy
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from typing import List
+import email.policy
 from openai import OpenAI
+import os
+import re
 
-# Load environment variables
-load_dotenv()
-APIKEY = os.getenv("api_key")
-
-# Clean text function
-def clean_text(text: str) -> str:
-    return text.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
-
-# Unified Document Assistant
 class UnifiedDocAssistant:
     def __init__(self):
         self.document_text = ""
 
     def load_file(self, file_obj, filename: str):
-        ext = filename.lower().split('.')[-1]
-        try:
-            if ext.find("pdf") != -1:
-                print("Loading PDF file...")
-                return self._load_pdf(file_obj)
-            elif ext == "docx":
-                return self._load_docx(file_obj)
-            elif ext == "eml":
-                return self._load_eml(file_obj)
-            else:
-                return "Unsupported file format"
-        except Exception as e:
-            return f"Error reading document: {e}"
+        ext = filename.split(".")
+        if "pdf" in ext:
+            return self._load_pdf(file_obj)
+        elif any(x in ext for x in ["docx", "docs", "word", "docm", "document"]):
+            return self._load_docx(file_obj)
+        elif "eml" in ext:
+            return self._load_eml(file_obj)
+        elif "txt" in ext:
+            return self._load_txt(file_obj)
+        else:
+            return f"Unsupported file extension: .{ext}"
 
     def _load_pdf(self, file_obj):
-        print("Extracting text from PDF...")
-        if not file_obj:
-            print("No file object provided for PDF extraction.")
-        reader = PyPDF2.PdfReader(file_obj)
-        text = "\n".join(page.extract_text() or "" for page in reader.pages)
-        self.document_text = text.strip()
-        if not self.document_text:
-            print("No text extracted from PDF.")
-        else:
-            print(f"Extracted {len(self.document_text)} characters from PDF.")
-        return "PDF extracted"
+        try:
+            reader = PdfReader(file_obj)
+            self.document_text = "\n".join(page.extract_text() or "" for page in reader.pages)
+            return "PDF loaded successfully."
+        except Exception as e:
+            return f"Error loading PDF: {str(e)}"
 
     def _load_docx(self, file_obj):
-        doc = docx.Document(file_obj)
-        text = "\n".join(p.text for p in doc.paragraphs)
-        self.document_text = clean_text(text.strip())
-        return "DOCX extracted"
+        try:
+            doc = Document(file_obj)
+            text = "\n".join(p.text for p in doc.paragraphs)
+            self.document_text = text.strip()
+            return "DOCX loaded successfully."
+        except Exception as e:
+            return f"Error loading DOCX: {str(e)}"
 
     def _load_eml(self, file_obj):
-        msg = email.message_from_binary_file(file_obj, policy=policy.default)
-        text = msg.get_body(preferencelist=('plain')).get_content()
-        self.document_text = clean_text(text.strip())
-        return "EML extracted"
+        try:
+            msg = email.message_from_binary_file(file_obj, policy=email.policy.default)
+            parts = [msg.get_body(preferencelist=('plain', 'html')).get_content()]
+            self.document_text = "\n".join(parts)
+            return "EML loaded successfully."
+        except Exception as e:
+            return f"Error loading EML: {str(e)}"
 
-    def ask_question(self, question: str):
+    def _load_txt(self, file_obj):
+        try:
+            self.document_text = file_obj.read().decode('utf-8')
+            return "TXT loaded successfully."
+        except Exception as e:
+            return f"Error loading TXT: {str(e)}"
+
+    def ask_question(self, question):
+        client = OpenAI(
+            api_key="API KEY HERE",  # Replace with your actual API key
+            base_url="https://integrate.api.nvidia.com/v1"
+        )
+
         if not self.document_text:
-            return self.document_text
+            return "No document loaded to provide context."
 
-        client = OpenAI(api_key=APIKEY, base_url="https://openrouter.ai/api/v1")
         response = client.chat.completions.create(
-            model="google/gemini-2.0-flash-exp:free",
+            model="nvidia/llama-3.3-nemotron-super-49b-v1.5",
             messages=[
-                {"role": "system", "content": f"You are a helpful assistant. If the question is not relevant to the document:\n\n{self.document_text}\n\nJust respond: 'Not relevant to the document'."},
+                {
+                    "role": "system",
+                    "content": f"You are a helpful assistant. If the user's question is not relevant to this document:\n\n{self.document_text}\n\nSay 'Not relevant to the document' without any explanation. Use this document as context."
+                },
                 {"role": "user", "content": question}
             ],
             temperature=0.6,
@@ -84,50 +96,73 @@ class UnifiedDocAssistant:
             max_tokens=2048,
             stream=False
         )
-        if self.document_text:
-            return response.choices[0].message.content.strip().replace("*", "") + "\n\nDocument context:\n" + self.document_text[:500]  # Limit context to first 500 chars
-        return self.document_text
 
-# FastAPI app setup
+        return self.format_answer(response.choices[0].message.content.strip().replace("*", ""))
+
+    def format_answer(self, raw_answer: str) -> str:
+        cleaned = re.sub(r"<think>.*?</think>", "", raw_answer, flags=re.DOTALL).strip()
+        return cleaned
+# main.py
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import List
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from io import BytesIO
+import requests
+import mimetypes
+import os
+
+from utils import UnifiedDocAssistant  # Assuming you have this implemented
+
 app = FastAPI()
 assistant = UnifiedDocAssistant()
 
-# Enable CORS if needed
+# Allow CORS (optional if using frontend)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Request model
 class HackRxRequest(BaseModel):
-    documents: str  # Document URL
+    documents: str  # URL to document (PDF, DOCX, EML, TXT)
     questions: List[str]
 
-# Document processing logic
-def process_document_from_url(document_url: str):
-    response = requests.get(document_url)
-    if response.status_code != 200:
-        raise HTTPException(status_code=400, detail="Unable to fetch document from URL")
-
-    filename = document_url.split("/")[-1]
-    result = assistant.load_file(BytesIO(response.content), filename)
-
-    if "Error" in result:
-        raise HTTPException(status_code=500, detail=result)
-    return result
-
-# Main API route
 @app.post("/api/v1/hackrx/run")
 async def hackrx_run(data: HackRxRequest):
     try:
-        res = process_document_from_url(data.documents)
-        print(f"Document processed: {res}")
-        answers = []
-        for q in data.questions:
-            ans = assistant.ask_question(q)
-            answers.append({"question": q, "answer": ans})
-        return {"document": data.documents, "answers": answers}
+        # Step 1: Fetch document from URL
+        response = requests.get(data.documents)
+        if response.status_code != 200:
+            raise HTTPException(status_code=400, detail="Failed to download document from provided URL.")
+
+        # Step 2: Determine filename and extension
+        filename = data.documents.split("/")[-1].split("?")[0]
+        if '.' not in filename:
+            raise HTTPException(status_code=400, detail="Cannot determine file extension from URL.")
+        
+        # Step 3: Load document using assistant
+        load_status = assistant.load_file(BytesIO(response.content), filename)
+        if not assistant.document_text.strip():
+            raise HTTPException(status_code=422, detail="Document was parsed but no text was extracted.")
+
+        # Step 4: Ask questions
+        answers = [
+            {"question": q, "answer": assistant.ask_question(q)}
+            for q in data.questions
+        ]
+
+        return JSONResponse(content={
+            "document": filename,
+            "status": load_status,
+            "answers": answers
+        })
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
